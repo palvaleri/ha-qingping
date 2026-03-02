@@ -1,28 +1,32 @@
 """A demonstration 'hub' that connects several devices."""
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 import logging
-_LOGGER = logging.getLogger(__name__)
-
-# In a real implementation, this would be in an external library that's on PyPI.
-# The PyPI package needs to be included in the `requirements` section of manifest.json
-# See https://developers.home-assistant.io/docs/creating_integration_manifest
-# for more information.
-# This dummy hub always returns 3 rollers.
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import device_registry as dr
-from homeassistant.const import CONF_HOST, CONF_PORT, CONF_PASSWORD, CONF_USERNAME
-
-
-from homeassistant.components.sensor import (
-    SensorDeviceClass
-)
+from typing import Callable
 
 import aiomqtt
+
+from homeassistant.components.sensor import SensorDeviceClass
+from homeassistant.const import (
+    CONF_HOST,
+    CONF_PASSWORD,
+    CONF_PORT,
+    CONF_USERNAME,
+    EVENT_HOMEASSISTANT_STOP,
+)
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
+
 from . import decode_mqqt_message
 from .const import DOMAIN, PLATFORMS
 
+_LOGGER = logging.getLogger(__name__)
+
+
 async def TestConnection(host, port:int, user, pwd):
+    "Test code."
     try:
         async with aiomqtt.Client(
             hostname = host,
@@ -39,7 +43,7 @@ class Hub:
     """Dummy hub for Hello World example."""
 
     def __init__(self, hass: HomeAssistant, entry_data, config_entry) -> None:
-        """Init dummy hub."""
+        """Init hub."""
         self._host = entry_data[CONF_HOST]
         self._port = int(entry_data[CONF_PORT])
         self._user = entry_data[CONF_USERNAME]
@@ -49,80 +53,168 @@ class Hub:
         self._id = self._host.lower()
         self.devices = {}
         self.config_entry = config_entry
-        self._platforms_loaded = False  # Флаг чтобы не вызывать async_forward_entry_setups много раз
         self.online = True
-        
-        # Добавляем callback для добавления новых сенсоров
-        self._add_entities_callback = None
+        self.unloading = False
+        self.client: aiomqtt.Client | None = None
 
-        hass.async_create_task(
-            self.task_on_mqtt_message()
+        self._listeners: dict[int, tuple[CALLBACK_TYPE, object | None]] = {}
+        self._last_listener_id: int = 0
+        self._stop_listener: CALLBACK_TYPE | None = hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STOP, self._handle_hass_stop
         )
 
-    def set_add_entities_callback(self, callback):
-        """Устанавливаем callback для добавления новых сенсоров."""
-        self._add_entities_callback = callback
+        # Run MQTT loop as a background task to avoid blocking HA startup.
+        self.looptask = hass.async_create_background_task(
+            self.task_on_mqtt_message(),
+            f"{DOMAIN}_mqtt_loop",
+            eager_start=True,
+        )
 
-    async def update_device(self, qp: Qingping):
-        # Проверяем, есть ли у нас основные данные из CG4
-        if not qp.data or not isinstance(qp.data, dict):
-            return # Выходим, если нет данных CG4
+    async def task_stop(self):
+        _LOGGER.debug("Start task stopping ...")
 
-        # Вызываем setup платформы только один раз (при первом валидном устройстве)
-        if not getattr(self, "_platforms_loaded", False):
-            await self._hass.config_entries.async_forward_entry_setups(self.config_entry, PLATFORMS)
-            self._platforms_loaded = True
+        self.unloading = True
+        if self._stop_listener:
+            self._stop_listener()
+            self._stop_listener = None
 
-        # 1. Блок создания УСТРОЙСТВА (выполняется один раз)
-        if not qp.device_registered:
-            # Теперь safe: все поля есть, устройство регистрируем полностью
-            device_registry = dr.async_get(self._hass)
-            device = device_registry.async_get_or_create(
-                config_entry_id=self.config_entry.entry_id,
-                connections={(dr.CONNECTION_NETWORK_MAC, qp.addr)}, # Используем стандартный тип соединения
-                identifiers={(DOMAIN, qp.addr)},
-                manufacturer="Qingping",
-                name=f"Qingping {qp.addr}",
-                model=qp.model,
-                sw_version=qp.firmware_version,
-                hw_version=qp.hardwareVersion,
-            )
-            qp.device_registered = True # Устанавливаем флаг, что устройство создано
+        if self.client:
+            disconnect = getattr(self.client, "disconnect", None)
+            if disconnect:
+                with suppress(Exception):
+                    await disconnect()
 
+        if self.looptask and not self.looptask.done():
+            self.looptask.cancel()
 
-        # Импортируем и создаём сенсоры только сейчас!
-        from .sensor import add_qingping_sensors
+        try:
+            _LOGGER.debug("Waiting for task_stop")
+            await asyncio.wait_for(self.looptask, timeout=2.0)
+            _LOGGER.debug("Stopped")
+        except asyncio.CancelledError:
+            _LOGGER.debug("Task cancelled")
+        except TimeoutError:
+            _LOGGER.debug("Task stop timeout")
 
-        # Вызываем функцию добавления. Она сама проверит, что уже создано, а что нет.
-        # Это позволяет добавлять сенсоры, которые появились в новых пакетах.
-        add_qingping_sensors(qp)
-
-        # 3. Публикуем обновления для всех существующих сенсоров
-        await qp.publish_updates()
-
+    @callback
+    def _handle_hass_stop(self, _event) -> None:
+        self.unloading = True
+        if self.looptask and not self.looptask.done():
+            self.looptask.cancel()
 
     async def task_on_mqtt_message(self):
-        topic = "qingping/+/up"
-        async with aiomqtt.Client(
-            hostname = self._host,
-            port     = self._port,
-            username = self._user,
-            password = self._pass) as client:
+        "Parse device sensors."
+        interval = 15  # Seconds
+        topic    = "qingping/+/up"
 
-            await client.subscribe(topic)
-            async for message in client.messages:
-                r = decode_mqqt_message.decode(message.topic, message.payload)
-                if r:
-                    mac = r['addr']
-                    if mac not in self.devices:
-                        self.devices[mac]=Qingping(self, mac)
+        while not self.unloading:
+            #_LOGGER.debug("Start new Loop ...")
+            try:
+                client = aiomqtt.Client(
+                    hostname = self._host,
+                    port     = self._port,
+                    username = self._user,
+                    password = self._pass
+                )
+                self.client = client
+                async with client:
+                    _LOGGER.info(f"Connected to MQTT Server")
 
-                    qp = self.devices[mac]
-                    qp.update_from_mqtt(r['data'])
-                    await self.update_device(qp)
+                    await client.subscribe(topic)
+
+                    _LOGGER.debug(f"Subscribed to {topic}")
+
+                    # Poll MQTT messages with timeout so unload can stop fast.
+                    while not self.unloading:
+                        try:
+                            message = await asyncio.wait_for(anext(client.messages), timeout=1.0)
+                        except TimeoutError:
+                            continue
+                        except StopAsyncIteration:
+                            break
+
+                        await self.parse_message(message)
+            except asyncio.CancelledError:
+                _LOGGER.debug("MQTT loop cancelled")
+                break
+            except aiomqtt.MqttError:
+                if not self.unloading:
+                    _LOGGER.error(f"Connection lost; Reconnecting in {interval} seconds ...")
+                    await asyncio.sleep(interval)
+            finally:
+                self.client = None
+
+        _LOGGER.debug("Loop stopped")
 
         return True
 
+    async def parse_message(self, message):
+        "Parse MQTT Message."
+        try:
+            _LOGGER.debug(f"Received MQTT message on topic: {message.topic}")
+            r = decode_mqqt_message.decode(message.topic, message.payload)
+            if r:
+                _LOGGER.debug(f"Decoded MQTT message: {r}")
+                a = r['addr']
+                if a not in self.devices:
+                    # skip no data messages
+                    if 'firmware_version' not in r['data']:
+                        return True
+
+                    _LOGGER.debug(f"Creating new Qingping device for address: {a}")
+                    qp =Qingping(self, r['addr'], r['data'])
+                    self.devices[a] = qp
+
+                    _LOGGER.debug(f"Creating device {qp.id} in Home Assistant.")
+                    device_registry = dr.async_get(self._hass)
+
+                    device = device_registry.async_get_or_create(
+                        config_entry_id = self.config_entry.entry_id,
+                        connections     = {(qp.addr, DOMAIN)},
+                        identifiers     = {(qp.addr, DOMAIN)},
+                        manufacturer    = "Qingping",
+                        name            = qp.name,
+                        model           = qp.model,
+                        sw_version      = qp.firmware_version,
+                        hw_version      = qp.hardwareVersion,
+                    )
+
+                    # HA Do not support runtime reconfig. So Uplaod everything and start again
+                    if len(self.devices)>1:
+                        _LOGGER.debug("async_update_listeners")
+                        self.async_update_listeners()
+                    else:
+                        _LOGGER.debug("async_forward_entry_setups")
+                        await self._hass.config_entries.async_forward_entry_setups(self.config_entry, PLATFORMS)
+                else:
+                    qp = self.devices[a]
+                    qp.update_from_mqtt(r['data'])
+                    if qp.ready:
+                        await qp.publish_updates()
+
+        except asyncio.CancelledError:
+            # Propagate cancellation so Home Assistant can stop cleanly.
+            raise
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.error(f"Parse_message Error: {str(e)}")
+
+        return True
+
+    @callback
+    def async_add_listener(self, update_callback, context=None):
+        "Callback to register callback to add new devices."
+        _LOGGER.debug('async_add_listener')
+
+        self._last_listener_id += 1
+        self._listeners[self._last_listener_id] = (update_callback, context)
+
+    @callback
+    def async_update_listeners(self) -> None:
+        """Update all registered listeners."""
+        _LOGGER.debug('async_update_listeners')
+
+        for update_callback, _ in list(self._listeners.values()):
+            update_callback()
 
     @property
     def hub_id(self) -> str:
@@ -139,94 +231,75 @@ class Hub:
 
 
 class Qingping:
-    """Dummy roller (device for HA) for Hello World example."""
+    """CGP22C."""
 
-    def __init__(self, hub: Hub, addr: str) -> None:
+    def __init__(self, hub: Hub, addr: str, data) -> None:
+        "Init."
         self.addr  = addr
         self.hub   = hub
-        self.name  = f"Qingping {qp.addr}"  # Имя по умолчанию
+        self.name  = addr
         self._callbacks = set()
 
         self.info = False #General Info
         self.data = False #Sensors Data
         self.history_data   = {}
         self.history_index  = 0
-        self.history_last_index  = 0
-        self.history_max    = 10
+        self.history_last_index = 0
+        self.history_max        = 10
+        self.sensors_created    = False
+        self.sensors = {
+            'battery'             : {'dc': SensorDeviceClass.BATTERY},
+            'temperature'         : {'dc': SensorDeviceClass.TEMPERATURE},
+            'humidity'            : {'dc': SensorDeviceClass.HUMIDITY},
+            'co2_ppm'             : {'dc': SensorDeviceClass.CO2},
+            'co2IsBeingCalibrated': {'diagnostic': True},
+            'isPluggedInToPower'  : {'diagnostic': True},
+            'status'              : {'diagnostic': True}
+        }
 
-        # Разделяем флаги для большей ясности
-        self.device_registered = False # Флаг, что само устройство создано в HA
-        self.sensors_created = False # Этот флаг можно даже убрать, но оставим для обратной совместимости
+        self.update_from_mqtt(data)
+
+        for s in self.sensors:
+            self.sensors[s]['supported'] = self.getValue(s) is not None
+
+        self.sensors['status']['supported'] = True
 
     def update_from_mqtt(self, data) -> None:
-        if data['_header']=='CG9':
-            self.info = data
-            """
-               '_header': 'CG9',
-                'autoOffTime': 0,
-                'co2ASC': True,
-                'co2IsBeingCalibrated': False,
-                'co2MeasurementInterval': 1800,
-                'co2Offset': 0,
-                'co2OffsetPercentage': 0.0,
-                'humidityOffset': 0.0,
-                'humidityOffsetPercentage': 0.0,
-                'productId': '3\x00',
-                'temperatureOffset': 0.0,
-                'temperatureOffsetPercentage': 0.0,
-                'temperatureUnit': 'celsius',
-                'timeMode': '24h',
-                'unk_key_04': b'<\x00',
-                'unk_key_05': b'\x84\x03',
-                'unk_key_06': b'\xe8\x03',
-                'unk_key_19': b'\x00',
-                'unk_key_44': b'\x01
-            """
-        elif data['_header']=='CG1':
-            self.history_data[self.history_index] = data
-            self.history_last_index = self.history_index
+        "Assing data to sensors."
+        _LOGGER.debug(f"Processing : {data}")
 
+        if data['magic'] == 'CG':
+            # 0x32 Configuration sending. Server -> Device
+            # 0x33 Firmware upgrade (Wi-Fi). Server -> Device
+            # 0x3A Network access setting. Server -> Device
+            # 0x3B Real-time data uploading. Device -> Server
 
-            if self.history_index >= self.history_max:
-                self.history_index = 0
+            if data['cmd'] in ['0x35']:
+                # {'header_old': 'CG5', 'magic': 'CG', 'cmd': '0x35', 'productId': '5d 00', 'timestamp': 1640995213}
+                pass
+            elif data['cmd'] in ['0x39']: #CG9
+                # 0x39 Configuration reporting. Device -> Server
+                self.info = data
+            elif data['cmd'] in ['0x34', '0x41']: #CG4, CGA
+                # 0x34 Event reporting. Device -> Server
+                # 0x41 ???
+                self.data = data
+            elif data['cmd'] in ['0x31', '0x42']: #CG1, CGB
+                # 0x31 Data uploading.  Device -> Server
+                # 0x42 ???
+                self.history_data[self.history_index] = data
+                self.history_last_index = self.history_index
+
+                if self.history_index >= self.history_max:
+                    self.history_index = 0
+                else:
+                    self.history_index = self.history_index + 1
             else:
-                self.history_index = self.history_index + 1
-
-            """
-                {'_header': 'CG1',
-                'isGoingIntoLowPowerMode': True,
-                'productId': '3\x00',
-                'unk_key_03': b'\x1c\xc6\xd5e\x84\x03\xa4\x11+5\x03d\xd3\x81)\xa8'
-                        b'\x02d'}}
-            """
-        elif data['_header']=='CG4':
-            self.data = data
-
-            """
-                '_header': 'CG4',
-                'battery': 100,
-                'co2IsBeingCalibrated': False,
-                'co2_ppm': 939,
-                'firmware_version': '2.0.0',
-                'hardwareVersion': '0000',
-                'humidity': 46.9,
-                'isGoingIntoLowPowerMode': True,
-                'isPluggedInToPower': False,
-                'mcuFirmwareVersion': '2.0.0',
-                'productId': '3\x00',
-                'temperature': 18.5,
-                'timestamp': 1708434246,
-                'unk_key_11': b'2.0.0',
-                'unk_key_14': b'F\xa3\xd4e\xd5\xd1*\xab\x03d\xcd\x00',
-                'unk_key_67': b'\x01\x00\x00\x00',
-                'wirelessModuleFirmwareVersion': '1.9.5'
-            """
-        else:
-            #print(data['_header'])
-            pass
+                _LOGGER.debug(f"Unknown cmd: {data}")
 
     @property
     def ready(self) -> bool:
+        "Init is done."
         return self.data != False
 
     @property
@@ -235,22 +308,35 @@ class Qingping:
         return self.addr
 
     @property
+    def online(self) -> bool:
+        "Online."
+        return self.hub.online
+
+    def getValue(self, s):
+        "Check if sensor present in json."
+        if self.data:
+            if s in self.data:
+                return self.data[s] # type: ignore
+
+            if s in self.data['sensor']: # type: ignore
+                return self.data['sensor'][s] # type: ignore
+
+        return None
+
+    @property
     def model(self) -> str:
-        if self.data:
-            return f'Air Monitor (productId: {self.data.get("productId", "")}) - {self.addr}'
-        return "Unknown"
+        "Mode for ha."
+        return self.addr
 
     @property
-    def firmware_version(self) -> str:
-        if self.data:
-            return self.data['firmware_version']
-        return "Unknown"
+    def firmware_version(self):
+        "Firmware ver."
+        return self.getValue('firmware_version')
 
     @property
-    def hardwareVersion(self) -> str:
-        if self.data:
-            return self.data['hardwareVersion']
-        return "Unknown"
+    def hardwareVersion(self):
+        "HardwareVersion."
+        return self.getValue('hardwareVersion')
 
     def register_callback(self, callback: Callable[[], None]) -> None:
         """Register callback, called when Roller changes state."""
@@ -260,84 +346,7 @@ class Qingping:
         """Remove previously registered callback."""
         self._callbacks.discard(callback)
 
-    # In a real implementation, this library would call it's call backs when it was
-    # notified of any state changeds for the relevant device.
     async def publish_updates(self) -> None:
         """Schedule call all registered callbacks."""
         for callback in self._callbacks:
             callback()
-
-    @property
-    def online(self) -> bool:
-        return self.hub.online
-
-    @property
-    def battery_level(self) -> int:
-        if self.data:
-            return self.data['sensor']['battery']
-        return 0
-
-    @property
-    def temperature(self) -> float:
-        if self.data:
-            return self.data['sensor']['temperature']
-        return 0.0
-
-    @property
-    def co2_ppm(self) -> int:
-        if self.data:
-            return self.data['sensor']['co2_ppm']
-        return 0
-
-    @property
-    def humidity(self) -> float:
-        if self.data:
-            return self.data['sensor']['humidity']
-        return 0.0
-
-    @property
-    def is_plugged_in(self) -> bool | None:
-        """Return True if the device is plugged in to power."""
-        if self.data:
-            return self.data.get("isPluggedInToPower")
-        return None
-
-    @property
-    def is_calibrating(self) -> bool | None:
-        """Return True if CO2 sensor is being calibrated."""
-        if self.data:
-            return self.data.get("co2IsBeingCalibrated")
-        return None
-
-    @property
-    def is_low_power_mode(self) -> bool | None:
-        """Return True if the device is in low power mode."""
-        if self.data:
-            return self.data.get("isGoingIntoLowPowerMode")
-        return None
-
-    @property
-    def last_update_timestamp(self) -> int | None:
-        """Return the timestamp of the last update from the device."""
-        if self.data:
-            return self.data.get("timestamp")
-        return None
-    
-    @property
-    def co2_measurement_interval(self) -> int | None:
-        """Return the CO2 measurement interval in seconds from device config."""
-        # Эти данные приходят в пакете CG9 (self.info)
-        if self.info:
-            return self.info.get("co2MeasurementInterval")
-        return None
-
-    @property
-    def extra_firmware_versions(self) -> dict:
-        """Return a dict of other firmware versions."""
-        versions = {}
-        if self.data:
-            if "wirelessModuleFirmwareVersion" in self.data:
-                versions["Wireless FW"] = self.data["wirelessModuleFirmwareVersion"]
-            if "mcuFirmwareVersion" in self.data:
-                versions["MCU FW"] = self.data["mcuFirmwareVersion"]
-        return versions
