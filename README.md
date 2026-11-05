@@ -8,6 +8,19 @@ https://github.com/GreyEarl/qingping-air-monitor-mqtt
 
 ## History Data
 
+Temperature, humidity, CO2 and battery sensors provide native units and
+`state_class: measurement`, enabling Home Assistant's long-term statistics.
+Temperature values decoded from MQTT are reported in Celsius; Home Assistant
+handles display-unit conversion. Existing sensor unique IDs are preserved.
+
+Statistics start after this version is loaded and Home Assistant's next
+statistics cycle. Existing recorder history is preserved, but is not
+automatically converted into older long-term statistics.
+
+The current availability implementation does not expire stale readings.
+Statistics can therefore include the last known value during delivery gaps;
+check the Status payload timestamps when interpreting a flat graph.
+
 Currently there is no much sence in history data (sesnor take measurment each 15 minutes, but uploads data once a hour)
 History data is fully parsed since version 0.2, but I can not find any Api in HA to put that data in ha entity history. Currently it's avaible in extended attributes for status sensor. 
 
