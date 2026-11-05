@@ -28,7 +28,7 @@ History data is fully parsed since version 0.2, but I can not find any Api in HA
 ## HACS Installation
 
 1. Go to http://homeassistant.local:8123/hacs/integrations
-1. Add `https://github.com/bob-tm/ha-qingping` custom integration repository
+1. Add `https://github.com/palvaleri/ha-qingping` custom integration repository
 1. Download the Qingping repository
 1. Go to http://homeassistant.local:8123/config/integrations and add new integration
 1. Choose "Qingping MQTT Parser" from the list and follow the config flow steps
@@ -40,6 +40,20 @@ History data is fully parsed since version 0.2, but I can not find any Api in HA
 ## HA 
 After HA Rebot sensors will be unavailable until first fresh data from qingping device. 
 Currenty unavailable status not tracked.
+
+## Development
+
+Run the sensor regression tests against the deployed Home Assistant version:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 uv run --python 3.14 \
+  --with homeassistant==2026.10.4 --with pytest --with pytest-asyncio \
+  --with aiomqtt python -m pytest -q tests \
+  -o asyncio_default_fixture_loop_scope=function
+```
+
+See the [Home Assistant sensor contract](https://contributors.home-assistant.io/core/entities/sensor/)
+for native values, units, state classes and long-term statistics.
 
 Credits to 
 https://github.com/niklasarnitz/qingping-co2-temp-rh-sensor-mqtt-parser for payload parsing code
