@@ -8,6 +8,19 @@ https://github.com/GreyEarl/qingping-air-monitor-mqtt
 
 ## History Data
 
+Temperature, humidity, CO2 and battery sensors provide native units and
+`state_class: measurement`, enabling Home Assistant's long-term statistics.
+Temperature values decoded from MQTT are reported in Celsius; Home Assistant
+handles display-unit conversion. Existing sensor unique IDs are preserved.
+
+Statistics start after this version is loaded and Home Assistant's next
+statistics cycle. Existing recorder history is preserved, but is not
+automatically converted into older long-term statistics.
+
+The current availability implementation does not expire stale readings.
+Statistics can therefore include the last known value during delivery gaps;
+check the Status payload timestamps when interpreting a flat graph.
+
 Currently there is no much sence in history data (sesnor take measurment each 15 minutes, but uploads data once a hour)
 History data is fully parsed since version 0.2, but I can not find any Api in HA to put that data in ha entity history. Currently it's avaible in extended attributes for status sensor. 
 
@@ -15,7 +28,7 @@ History data is fully parsed since version 0.2, but I can not find any Api in HA
 ## HACS Installation
 
 1. Go to http://homeassistant.local:8123/hacs/integrations
-1. Add `https://github.com/bob-tm/ha-qingping` custom integration repository
+1. Add `https://github.com/palvaleri/ha-qingping` custom integration repository
 1. Download the Qingping repository
 1. Go to http://homeassistant.local:8123/config/integrations and add new integration
 1. Choose "Qingping MQTT Parser" from the list and follow the config flow steps
@@ -27,6 +40,20 @@ History data is fully parsed since version 0.2, but I can not find any Api in HA
 ## HA 
 After HA Rebot sensors will be unavailable until first fresh data from qingping device. 
 Currenty unavailable status not tracked.
+
+## Development
+
+Run the sensor regression tests against the deployed Home Assistant version:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 uv run --python 3.14 \
+  --with homeassistant==2026.10.4 --with pytest --with pytest-asyncio \
+  --with aiomqtt python -m pytest -q tests \
+  -o asyncio_default_fixture_loop_scope=function
+```
+
+See the [Home Assistant sensor contract](https://contributors.home-assistant.io/core/entities/sensor/)
+for native values, units, state classes and long-term statistics.
 
 Credits to 
 https://github.com/niklasarnitz/qingping-co2-temp-rh-sensor-mqtt-parser for payload parsing code

@@ -1,12 +1,25 @@
-"Sesnors for QP."
+"""Sensors for Qingping MQTT devices."""
 
 from typing import Any
 
-from homeassistant.const import EntityCategory, UnitOfTemperature
-from homeassistant.helpers.entity import Entity
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
+from homeassistant.const import (
+    PERCENTAGE,
+    EntityCategory,
+    UnitOfRatio,
+    UnitOfTemperature,
+)
 
 from .const import DOMAIN
 from .hub import Qingping
+
+
+_SENSOR_UNITS = {
+    SensorDeviceClass.TEMPERATURE: UnitOfTemperature.CELSIUS,
+    SensorDeviceClass.HUMIDITY: PERCENTAGE,
+    SensorDeviceClass.CO2: UnitOfRatio.PARTS_PER_MILLION,
+    SensorDeviceClass.BATTERY: PERCENTAGE,
+}
 
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
@@ -31,7 +44,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     if len(hub.devices)==1:
         hub.async_add_listener(_check_device)
 
-class SensorBase(Entity):
+class SensorBase(SensorEntity):
     'Descr.'
     should_poll  = False
 
@@ -43,6 +56,9 @@ class SensorBase(Entity):
         self.sensor_name        = sensor_name
 
         self._attr_device_class = device_class
+        if device_class in _SENSOR_UNITS:
+            self._attr_native_unit_of_measurement = _SENSOR_UNITS[device_class]
+            self._attr_state_class = SensorStateClass.MEASUREMENT
 
         name_postfix = sensor_name if device_class is None else device_class
 
@@ -53,17 +69,6 @@ class SensorBase(Entity):
 
         if sensor_name=='status':
             self._attr_name = f"{qp_device.name} Status"
-
-    # never called
-    # @property
-    # def native_unit_of_measurement(self):
-    #    if self.device_class==SensorDeviceClass.TEMPERATURE:
-    #        if self._qp_device.info:
-    #            if 'temperatureUnit' in self._qp_device.info:
-    #                if self._qp_device.info['temperatureUnit']=='celsius':
-    #                    return UnitOfTemperature.CELSIUS
-    #                else:
-    #                    return UnitOfTemperature.FAHRENHEIT
 
     @property
     def device_info(self):
@@ -79,6 +84,7 @@ class SensorBase(Entity):
 
     async def async_added_to_hass(self):
         """Run when this Entity has been added to HA."""
+        await super().async_added_to_hass()
         # Sensors should also register callbacks to HA when their state changes
         self._qp_device.register_callback(self.async_write_ha_state)
 
@@ -86,6 +92,7 @@ class SensorBase(Entity):
         """Entity being removed from hass."""
         # The opposite of async_added_to_hass. Remove any registered call backs here.
         self._qp_device.remove_callback(self.async_write_ha_state)
+        await super().async_will_remove_from_hass()
 
     @property
     def entity_category(self):
@@ -96,15 +103,15 @@ class SensorBase(Entity):
             return None
 
     @property
-    def state(self):
-        'State.'
+    def native_value(self):
+        """Return the decoder's value in its native unit (Celsius for temperature)."""
         if self.sensor_name=='status':
              return 'data in attributes'
 
         return self._qp_device.getValue(self.sensor_name)
 
     @property
-    def extra_state_attributes(self) -> dict[str, Any]:
+    def extra_state_attributes(self) -> dict[str, Any] | None:
         "Attributes added for debug."
         if self.sensor_name != 'status':
             return None
